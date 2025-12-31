@@ -111,20 +111,41 @@ def fetch_latest_comment(order_id):
         }
     )
 
-    if not r.ok:
-        print("❌ Shopify GraphQL failed:", r.text, flush=True)
+    try:
+        payload = r.json()
+    except Exception:
+        print("❌ Invalid JSON from Shopify:", r.text, flush=True)
         return None
 
-    events = r.json()["data"]["order"]["events"]["edges"]
+    # 🔴 GraphQL error handling
+    if "errors" in payload:
+        print("❌ Shopify GraphQL errors:", payload["errors"], flush=True)
+        return None
+
+    data = payload.get("data")
+    if not data:
+        print("⏭️ No data returned from Shopify", flush=True)
+        return None
+
+    order = data.get("order")
+    if not order:
+        print("⏭️ Order not found in GraphQL response", flush=True)
+        return None
+
+    events = order.get("events", {}).get("edges", [])
+    if not events:
+        print("⏭️ No events found", flush=True)
+        return None
 
     for edge in events:
-        node = edge["node"]
-        if node["__typename"] == "OrderCommentEvent":
+        node = edge.get("node", {})
+        if node.get("__typename") == "OrderCommentEvent":
             print("💬 Found timeline comment:", node["message"], flush=True)
             return node
 
-    print("⏭️ No timeline comment found", flush=True)
+    print("⏭️ No timeline comments in events", flush=True)
     return None
+
 
 # --------------------------------------------------
 # 🔔 Shopify Webhook
