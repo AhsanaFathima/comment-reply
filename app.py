@@ -3,32 +3,58 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
+# ---------------- ENV ----------------
 SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-CHANNEL_ID = "C0A02M2VCTB"
 
+# ✅ UPDATED CHANNEL ID
+CHANNEL_ID = "C0A068PHZMY"
+
+# STRICT MATCH: ONLY "ST.order #1234"
 ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b")
 
-# Memory (replace with DB later)
+# In-memory stores (OK for now)
 order_threads = {}
 processed_comments = set()
 
-# ---------------- SLACK ----------------
+print("🚀 App started", flush=True)
+print("🏪 Shopify shop:", SHOP, flush=True)
+print("📢 Slack channel:", CHANNEL_ID, flush=True)
+
+# --------------------------------------------------
+# 🔍 Find Slack thread timestamp
+# --------------------------------------------------
 def find_thread_ts(order_number):
+    print(f"🔍 Searching Slack thread for order #{order_number}", flush=True)
+
     r = requests.get(
         "https://slack.com/api/conversations.history",
         headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
         params={"channel": CHANNEL_ID, "limit": 100}
     )
+
+    if not r.ok:
+        print("❌ Slack history API failed:", r.text, flush=True)
+        return None
+
     for msg in r.json().get("messages", []):
-        if ORDER_REGEX.search(msg.get("text", "")):
-            if ORDER_REGEX.search(msg["text"]).group(1) == order_number:
-                return msg["ts"]
+        text = msg.get("text", "")
+        match = ORDER_REGEX.search(text)
+        if match and match.group(1) == order_number:
+            print("✅ Found Slack order message:", text, flush=True)
+            return msg["ts"]
+
+    print("❌ No Slack thread found", flush=True)
     return None
 
+# --------------------------------------------------
+# 💬 Send Slack thread reply
+# --------------------------------------------------
 def slack_reply(thread_ts, text):
-    requests.post(
+    print("📤 Sending Slack thread reply", flush=True)
+
+    r = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={
             "Authorization": f"Bearer {SLACK_TOKEN}",
@@ -41,8 +67,17 @@ def slack_reply(thread_ts, text):
         }
     )
 
-# ---------------- SHOPIFY GRAPHQL ----------------
+    if r.ok and r.json().get("ok"):
+        print("✅ Slack reply sent", flush=True)
+    else:
+        print("❌ Slack reply failed:", r.text, flush=True)
+
+# --------------------------------------------------
+# 🧠 Shopify GraphQL — fetch timeline comments
+# --------------------------------------------------
 def fetch_latest_comment(order_id):
+    print("🧠 Fetching Shopify timeline comments", flush=True)
+
     url = f"https://{SHOP}/admin/api/2024-01/graphql.json"
 
     query = """
@@ -76,39 +111,60 @@ def fetch_latest_comment(order_id):
         }
     )
 
-    for edge in r.json()["data"]["order"]["events"]["edges"]:
+    if not r.ok:
+        print("❌ Shopify GraphQL failed:", r.text, flush=True)
+        return None
+
+    events = r.json()["data"]["order"]["events"]["edges"]
+
+    for edge in events:
         node = edge["node"]
         if node["__typename"] == "OrderCommentEvent":
+            print("💬 Found timeline comment:", node["message"], flush=True)
             return node
+
+    print("⏭️ No timeline comment found", flush=True)
     return None
 
-# ---------------- WEBHOOK ----------------
+# --------------------------------------------------
+# 🔔 Shopify Webhook
+# --------------------------------------------------
 @app.route("/webhook/order-updated", methods=["POST"])
 def order_updated():
-    data = request.json
+    print("\n🔔 Shopify ORDER UPDATED webhook received", flush=True)
 
+    data = request.json
     order_number = str(data.get("order_number"))
     order_id = data.get("id")
 
+    print("🧾 Order number:", order_number, flush=True)
+    print("🆔 Order ID:", order_id, flush=True)
+
+    # Find Slack thread
     thread_ts = order_threads.get(order_number) or find_thread_ts(order_number)
     if not thread_ts:
+        print("❌ Slack thread not found", flush=True)
         return "No Slack thread", 200
 
     order_threads[order_number] = thread_ts
 
+    # Fetch comment
     comment = fetch_latest_comment(order_id)
     if not comment:
         return "No comment", 200
 
+    # Dedup
     dedup_key = hashlib.md5(
         f"{comment['message']}{comment['createdAt']}".encode()
     ).hexdigest()
 
     if dedup_key in processed_comments:
+        print("🔁 Duplicate comment ignored", flush=True)
         return "Duplicate", 200
 
     processed_comments.add(dedup_key)
 
+    # Reply in Slack thread
     slack_reply(
         thread_ts,
         f"💬 *{comment['author']['name']}*\n>{comment['message']}"
@@ -116,6 +172,10 @@ def order_updated():
 
     return "OK", 200
 
-# ---------------- RUN ----------------
+# --------------------------------------------------
+# 🚀 Run app (Render-compatible)
+# --------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    port = int(os.getenv("PORT", 10000))
+    print(f"🚀 Starting server on port {port}", flush=True)
+    app.run(host="0.0.0.0", port=port)
