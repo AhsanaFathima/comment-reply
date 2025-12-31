@@ -1,84 +1,121 @@
-import os
-import re
-import requests
-from flask import Flask, request, jsonify
+import os, re, requests, hashlib
+from flask import Flask, request
 
 app = Flask(__name__)
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SHOP = os.getenv("SHOPIFY_SHOP")
+SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+CHANNEL_ID = "C0A02M2VCTB"
 
-# In-memory store (already exists in your app)
+ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b")
+
+# Memory (replace with DB later)
 order_threads = {}
+processed_comments = set()
 
-def post_slack_reply(channel, thread_ts, message):
-    print("📤 Sending reply to Slack...", flush=True)
-    print(f"   ➤ Channel: {channel}", flush=True)
-    print(f"   ➤ Thread TS: {thread_ts}", flush=True)
-    print(f"   ➤ Message: {message}", flush=True)
+# ---------------- SLACK ----------------
+def find_thread_ts(order_number):
+    r = requests.get(
+        "https://slack.com/api/conversations.history",
+        headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+        params={"channel": CHANNEL_ID, "limit": 100}
+    )
+    for msg in r.json().get("messages", []):
+        if ORDER_REGEX.search(msg.get("text", "")):
+            if ORDER_REGEX.search(msg["text"]).group(1) == order_number:
+                return msg["ts"]
+    return None
 
-    url = "https://slack.com/api/chat.postMessage"
-    headers = {
-        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "channel": channel,
-        "thread_ts": thread_ts,
-        "text": message
-    }
-
-    r = requests.post(url, headers=headers, json=payload)
-    print(f"✅ Slack API response: {r.status_code} | {r.text}", flush=True)
-
-
-@app.route("/webhook/order-updated", methods=["POST"])
-def order_updated():
-    print("🔔 Shopify ORDER UPDATED webhook received", flush=True)
-
-    data = request.json
-    if not data:
-        print("❌ No JSON payload received", flush=True)
-        return "Invalid payload", 400
-
-    print("📦 Full payload keys:", list(data.keys()), flush=True)
-
-    order_number = data.get("order_number")
-    note = data.get("note")
-
-    print(f"🧾 Order number: {order_number}", flush=True)
-    print(f"📝 Order note (comment): {note}", flush=True)
-
-    # 🚫 No comment → ignore
-    if not note:
-        print("⏭️ No comment found — ignoring webhook", flush=True)
-        return "No comment", 200
-
-    order_number = str(order_number)
-
-    # 🚫 Order not tracked in Slack
-    thread_info = order_threads.get(order_number)
-    if not thread_info:
-        print(f"❌ Order #{order_number} not found in order_threads", flush=True)
-        return "Order not found in Slack threads", 200
-
-    channel = thread_info.get("channel")
-    thread_ts = thread_info.get("thread_ts")
-
-    print("🧵 Slack thread found", flush=True)
-    print(f"   ➤ Channel: {channel}", flush=True)
-    print(f"   ➤ Thread TS: {thread_ts}", flush=True)
-
-    # ✅ Post as thread reply
-    post_slack_reply(
-        channel,
-        thread_ts,
-        f"💬 *Shopify Comment:*\n>{note}"
+def slack_reply(thread_ts, text):
+    requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={
+            "Authorization": f"Bearer {SLACK_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "channel": CHANNEL_ID,
+            "thread_ts": thread_ts,
+            "text": text
+        }
     )
 
-    print("🎉 Comment successfully posted to Slack thread", flush=True)
-    return "Comment sent to Slack", 200
+# ---------------- SHOPIFY GRAPHQL ----------------
+def fetch_latest_comment(order_id):
+    url = f"https://{SHOP}/admin/api/2024-01/graphql.json"
 
+    query = """
+    query ($id: ID!) {
+      order(id: $id) {
+        events(first: 5, reverse: true) {
+          edges {
+            node {
+              __typename
+              ... on OrderCommentEvent {
+                message
+                createdAt
+                author { name }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    r = requests.post(
+        url,
+        headers={
+            "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+            "Content-Type": "application/json"
+        },
+        json={
+            "query": query,
+            "variables": {"id": f"gid://shopify/Order/{order_id}"}
+        }
+    )
+
+    for edge in r.json()["data"]["order"]["events"]["edges"]:
+        node = edge["node"]
+        if node["__typename"] == "OrderCommentEvent":
+            return node
+    return None
+
+# ---------------- WEBHOOK ----------------
+@app.route("/webhook/order-updated", methods=["POST"])
+def order_updated():
+    data = request.json
+
+    order_number = str(data.get("order_number"))
+    order_id = data.get("id")
+
+    thread_ts = order_threads.get(order_number) or find_thread_ts(order_number)
+    if not thread_ts:
+        return "No Slack thread", 200
+
+    order_threads[order_number] = thread_ts
+
+    comment = fetch_latest_comment(order_id)
+    if not comment:
+        return "No comment", 200
+
+    dedup_key = hashlib.md5(
+        f"{comment['message']}{comment['createdAt']}".encode()
+    ).hexdigest()
+
+    if dedup_key in processed_comments:
+        return "Duplicate", 200
+
+    processed_comments.add(dedup_key)
+
+    slack_reply(
+        thread_ts,
+        f"💬 *{comment['author']['name']}*\n>{comment['message']}"
+    )
+
+    return "OK", 200
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Starting Flask app on port {port}", flush=True)
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
