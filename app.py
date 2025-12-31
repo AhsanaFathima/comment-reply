@@ -77,3 +77,8 @@ def order_updated():
 
     print("🎉 Comment successfully posted to Slack thread", flush=True)
     return "Comment sent to Slack", 200
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Starting Flask app on port {port}", flush=True)
+    app.run(host="0.0.0.0", port=port)
