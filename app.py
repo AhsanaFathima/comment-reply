@@ -1,4 +1,4 @@
-import os, re, requests, hashlib, time
+import os, re, requests
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -11,12 +11,12 @@ SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 # Slack channel
 CHANNEL_ID = "C0A068PHZMY"
 
-# ✅ FIXED REGEX (allow text after order number)
+# Match: ST.order #1029 | anything after
 ORDER_REGEX = re.compile(r"ST\.order\s+#(\d+)")
 
 # In-memory stores
-order_threads = {}
-processed_comments = set()
+order_threads = {}        # { order_number: thread_ts }
+last_comment_time = {}    # { order_number: createdAt }
 
 print("🚀 App started", flush=True)
 print("🏪 Shopify shop:", SHOP, flush=True)
@@ -73,7 +73,7 @@ def slack_reply(thread_ts, text):
         print("❌ Slack reply failed:", r.text, flush=True)
 
 # --------------------------------------------------
-# 🧠 Shopify GraphQL — fetch timeline comments
+# 🧠 Shopify GraphQL — fetch latest timeline comment
 # --------------------------------------------------
 def fetch_latest_comment(order_id):
     print("🧠 Fetching Shopify timeline comments", flush=True)
@@ -123,6 +123,7 @@ def fetch_latest_comment(order_id):
 
     order = payload.get("data", {}).get("order")
     if not order:
+        print("⏭️ No order data returned", flush=True)
         return None
 
     events = order.get("events", {}).get("edges", [])
@@ -156,28 +157,21 @@ def order_updated():
 
     order_threads[order_number] = thread_ts
 
-    # 🔁 FIX: Retry once after delay
+    # Fetch latest comment
     comment = fetch_latest_comment(order_id)
-
     if not comment:
-        print("⏳ No comment yet — retrying in 5 seconds", flush=True)
-        time.sleep(5)
-        comment = fetch_latest_comment(order_id)
-
-    if not comment:
-        print("❌ Still no comment after retry", flush=True)
+        print("⏭️ No comment available on this update", flush=True)
         return "No comment", 200
 
-    # Dedup
-    dedup_key = hashlib.md5(
-        f"{comment['message']}{comment['createdAt']}".encode()
-    ).hexdigest()
+    comment_time = comment["createdAt"]
 
-    if dedup_key in processed_comments:
-        print("🔁 Duplicate comment ignored", flush=True)
+    # 🔁 Only send if NEW comment
+    if last_comment_time.get(order_number) == comment_time:
+        print("🔁 Comment already sent to Slack", flush=True)
         return "Duplicate", 200
 
-    processed_comments.add(dedup_key)
+    # Mark as sent
+    last_comment_time[order_number] = comment_time
 
     # Reply in Slack thread
     slack_reply(
