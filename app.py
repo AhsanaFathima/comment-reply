@@ -1,4 +1,4 @@
-import os, re, requests, hashlib
+import os, re, requests, hashlib, time
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -8,13 +8,13 @@ SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
-# ✅ UPDATED CHANNEL ID
+# Slack channel
 CHANNEL_ID = "C0A068PHZMY"
 
-# STRICT MATCH: ONLY "ST.order #1234"
-ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b")
+# ✅ FIXED REGEX (allow text after order number)
+ORDER_REGEX = re.compile(r"ST\.order\s+#(\d+)")
 
-# In-memory stores (OK for now)
+# In-memory stores
 order_threads = {}
 processed_comments = set()
 
@@ -31,7 +31,7 @@ def find_thread_ts(order_number):
     r = requests.get(
         "https://slack.com/api/conversations.history",
         headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-        params={"channel": CHANNEL_ID, "limit": 100}
+        params={"channel": CHANNEL_ID, "limit": 500}
     )
 
     if not r.ok:
@@ -42,7 +42,7 @@ def find_thread_ts(order_number):
         text = msg.get("text", "")
         match = ORDER_REGEX.search(text)
         if match and match.group(1) == order_number:
-            print("✅ Found Slack order message:", text, flush=True)
+            print("✅ Found Slack order message", flush=True)
             return msg["ts"]
 
     print("❌ No Slack thread found", flush=True)
@@ -114,7 +114,7 @@ def fetch_latest_comment(order_id):
     try:
         payload = r.json()
     except Exception:
-        print("❌ Invalid JSON from Shopify:", r.text, flush=True)
+        print("❌ Invalid JSON from Shopify", flush=True)
         return None
 
     if "errors" in payload:
@@ -123,14 +123,9 @@ def fetch_latest_comment(order_id):
 
     order = payload.get("data", {}).get("order")
     if not order:
-        print("⏭️ No order data returned", flush=True)
         return None
 
     events = order.get("events", {}).get("edges", [])
-    if not events:
-        print("⏭️ No events found", flush=True)
-        return None
-
     for edge in events:
         node = edge.get("node", {})
         if node.get("__typename") == "CommentEvent":
@@ -152,7 +147,6 @@ def order_updated():
     order_id = data.get("id")
 
     print("🧾 Order number:", order_number, flush=True)
-    print("🆔 Order ID:", order_id, flush=True)
 
     # Find Slack thread
     thread_ts = order_threads.get(order_number) or find_thread_ts(order_number)
@@ -162,9 +156,16 @@ def order_updated():
 
     order_threads[order_number] = thread_ts
 
-    # Fetch comment
+    # 🔁 FIX: Retry once after delay
     comment = fetch_latest_comment(order_id)
+
     if not comment:
+        print("⏳ No comment yet — retrying in 5 seconds", flush=True)
+        time.sleep(5)
+        comment = fetch_latest_comment(order_id)
+
+    if not comment:
+        print("❌ Still no comment after retry", flush=True)
         return "No comment", 200
 
     # Dedup
