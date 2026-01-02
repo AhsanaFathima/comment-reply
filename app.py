@@ -25,29 +25,31 @@ def health():
     return "OK", 200
 
 # ---------------- SLACK ----------------
-def find_thread_ts(order_number):
-    print(f"🔍 Searching Slack for ST.order #{order_number}", flush=True)
+def find_thread_ts(order_number, timeout=90):
+    print(f"⏳ Waiting for Slack message ST.order #{order_number}", flush=True)
 
-    r = requests.get(
-        "https://slack.com/api/conversations.history",
-        headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-        params={"channel": CHANNEL_ID, "limit": 500},
-        timeout=10
-    )
+    start = time.time()
 
-    if not r.ok:
-        print("❌ Slack API error", r.text, flush=True)
-        return None
+    while time.time() - start < timeout:
+        r = requests.get(
+            "https://slack.com/api/conversations.history",
+            headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+            params={"channel": CHANNEL_ID, "limit": 100},
+            timeout=10
+        )
 
-    for msg in r.json().get("messages", []):
-        m = ORDER_REGEX.search(msg.get("text", ""))
-        if m and m.group(1) == order_number:
-            print("✅ Slack order thread found", flush=True)
-            return msg["ts"]
+        if r.ok:
+            for msg in r.json().get("messages", []):
+                text = msg.get("text", "")
+                m = ORDER_REGEX.search(text)
+                if m and m.group(1) == order_number:
+                    print("✅ Slack order message FOUND", flush=True)
+                    return msg["ts"]
 
-    print("❌ Slack order thread NOT found", flush=True)
+        time.sleep(5)
+
+    print("⏹️ Slack message did not appear in time", flush=True)
     return None
-
 
 def slack_reply(thread_ts, text):
     print("📤 Sending Slack reply", flush=True)
