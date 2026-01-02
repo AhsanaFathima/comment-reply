@@ -115,9 +115,21 @@ def process_order(order_number, order_id):
             return
 
         order_threads[order_number] = thread_ts
+
+        # 🔥 FIX: Send latest comment immediately (for old orders)
+        comment = fetch_latest_comment(order_id)
+        if comment:
+            last_comment_time[order_number] = comment["createdAt"]
+            slack_reply(
+                thread_ts,
+                f"💬 *{comment['author']['name']}*\n>{comment['message']}"
+            )
+            print("✅ Initial comment sent", flush=True)
+
         idle_start = time.time()
 
-        while time.time() - idle_start < 300:  # 👈 watch for 5 minutes
+        # Continue watching for NEW comments
+        while time.time() - idle_start < 300:
             comment = fetch_latest_comment(order_id)
             if comment:
                 ts = comment["createdAt"]
@@ -127,8 +139,8 @@ def process_order(order_number, order_id):
                         thread_ts,
                         f"💬 *{comment['author']['name']}*\n>{comment['message']}"
                     )
-                    print("✅ Comment sent", flush=True)
-                    idle_start = time.time()  # reset idle timer
+                    print("✅ New comment sent", flush=True)
+                    idle_start = time.time()
             time.sleep(10)
 
     finally:
