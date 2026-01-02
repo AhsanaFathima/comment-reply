@@ -14,7 +14,7 @@ ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b")
 # Memory (resets on restart – OK for free plan)
 order_threads = {}        # order_number → thread_ts
 last_comment_time = {}    # order_number → createdAt
-active_pollers = set()    # orders currently being polled
+active_workers = set()    # orders being processed
 
 print("🚀 App started", flush=True)
 
@@ -25,9 +25,8 @@ def health():
     return "OK", 200
 
 # ---------------- SLACK ----------------
-def find_thread_ts(order_number, timeout=90):
+def wait_for_slack_thread(order_number, timeout=90):
     print(f"⏳ Waiting for Slack message ST.order #{order_number}", flush=True)
-
     start = time.time()
 
     while time.time() - start < timeout:
@@ -51,9 +50,9 @@ def find_thread_ts(order_number, timeout=90):
     print("⏹️ Slack message did not appear in time", flush=True)
     return None
 
+
 def slack_reply(thread_ts, text):
     print("📤 Sending Slack reply", flush=True)
-
     requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={
@@ -102,42 +101,48 @@ def fetch_latest_comment(order_id):
         timeout=10
     )
 
-    data = r.json().get("data", {}).get("order")
-    if not data:
+    order = r.json().get("data", {}).get("order")
+    if not order:
         return None
 
-    for edge in data["events"]["edges"]:
+    for edge in order["events"]["edges"]:
         node = edge["node"]
         if node["__typename"] == "CommentEvent":
             return node
 
     return None
 
-# ---------------- POLLER ----------------
-def poll_comments(order_number, order_id):
-    print(f"👀 Polling comments for order #{order_number}", flush=True)
-
-    start = time.time()
+# ---------------- BACKGROUND WORKER ----------------
+def process_order(order_number, order_id):
+    print(f"🧵 Worker started for order #{order_number}", flush=True)
 
     try:
-        while time.time() - start < 120:  # ⏱️ max 2 minutes
+        # 1️⃣ Wait for Slack order message
+        thread_ts = wait_for_slack_thread(order_number)
+        if not thread_ts:
+            return
+
+        order_threads[order_number] = thread_ts
+
+        # 2️⃣ Poll for comment
+        start = time.time()
+        while time.time() - start < 120:
             comment = fetch_latest_comment(order_id)
             if comment:
                 ts = comment["createdAt"]
                 if last_comment_time.get(order_number) != ts:
                     last_comment_time[order_number] = ts
-                    thread_ts = order_threads.get(order_number)
-                    if thread_ts:
-                        slack_reply(
-                            thread_ts,
-                            f"💬 *{comment['author']['name']}*\n>{comment['message']}"
-                        )
-                        print("✅ Comment sent to Slack", flush=True)
+                    slack_reply(
+                        thread_ts,
+                        f"💬 *{comment['author']['name']}*\n>{comment['message']}"
+                    )
+                    print("✅ Comment sent to Slack", flush=True)
                 break
             time.sleep(10)
+
     finally:
-        active_pollers.discard(order_number)
-        print(f"⏹️ Poller stopped for order #{order_number}", flush=True)
+        active_workers.discard(order_number)
+        print(f"⏹️ Worker stopped for order #{order_number}", flush=True)
 
 # ---------------- WEBHOOK ----------------
 @app.route("/webhook/order-updated", methods=["POST"])
@@ -151,25 +156,21 @@ def webhook():
     if not order_number or not order_id:
         return "Invalid payload", 200
 
-    if order_number not in order_threads:
-        ts = find_thread_ts(order_number)
-        if not ts:
-            return "Slack thread not found", 200
-        order_threads[order_number] = ts
+    # 🚫 Prevent duplicate workers
+    if order_number in active_workers:
+        print("⏭️ Worker already running", flush=True)
+        return "Already processing", 200
 
-    # 🚫 Prevent duplicate pollers
-    if order_number in active_pollers:
-        print("⏭️ Poller already running", flush=True)
-        return "Poller already running", 200
+    active_workers.add(order_number)
 
-    active_pollers.add(order_number)
-
+    # 🚀 Start background worker
     threading.Thread(
-        target=poll_comments,
+        target=process_order,
         args=(order_number, order_id),
         daemon=True
     ).start()
 
+    # ⚡ RETURN IMMEDIATELY (prevents timeout)
     return "OK", 200
 
 # ---------------- RUN ----------------
