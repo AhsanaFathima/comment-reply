@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import hashlib
+import base64
 from datetime import datetime
 from flask import Flask, request, jsonify, abort
 from slack_sdk import WebClient
@@ -21,26 +22,39 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 # STRICT MATCH: ONLY "ST.order #1234"
 ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b", re.IGNORECASE)
 
-# Prevent duplicate Slack replies
+# Deduplication store (in-memory)
 processed_comments = set()
 
 print("🚀 Shopify → Slack bridge started", flush=True)
 
 # ---------------- HELPERS ----------------
 def verify_shopify_webhook(raw_body, hmac_header):
-    """Verify Shopify webhook signature"""
+    """
+    Verify Shopify webhook using Base64 HMAC.
+    Safe against missing/invalid headers.
+    """
     if not SHOPIFY_WEBHOOK_SECRET:
-        print("⚠️ Webhook secret not set — skipping verification")
+        print("⚠️ SHOPIFY_WEBHOOK_SECRET not set — skipping verification")
         return True
 
-    calculated_hmac = hmac.new(
-        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256
-    ).digest()
+    if not hmac_header:
+        print("❌ Missing X-Shopify-Hmac-Sha256 header")
+        return False
 
-    received_hmac = bytes.fromhex(hmac_header) if len(hmac_header) == 64 else None
-    return hmac.compare_digest(calculated_hmac, received_hmac)
+    try:
+        calculated_hmac = hmac.new(
+            SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256
+        ).digest()
+
+        received_hmac = base64.b64decode(hmac_header)
+
+        return hmac.compare_digest(calculated_hmac, received_hmac)
+
+    except Exception as e:
+        print("❌ HMAC verification error:", e)
+        return False
 
 
 def find_slack_thread(order_number):
@@ -63,8 +77,8 @@ def find_slack_thread(order_number):
     return None
 
 
-def post_thread_reply(thread_ts, comment_text, author="Shopify"):
-    """Post reply in Slack thread"""
+def post_slack_thread_reply(thread_ts, comment_text, author="Shopify"):
+    """Post reply inside Slack thread"""
     try:
         slack_client.chat_postMessage(
             channel=SLACK_CHANNEL_ID,
@@ -106,16 +120,17 @@ def health():
 
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
+    print("🔥 /webhook/shopify HIT", flush=True)
+
     # ---- Verify webhook ----
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-    if hmac_header and not verify_shopify_webhook(request.data, hmac_header):
+    if not verify_shopify_webhook(request.data, hmac_header):
         abort(401, "Invalid webhook signature")
 
-    payload = request.get_json()
+    payload = request.get_json(silent=True) or {}
     print("🔔 Shopify webhook received", flush=True)
 
     comment_text = None
-    order_number = None
 
     # ---- Extract comment from order ----
     if "order" in payload:
@@ -151,7 +166,7 @@ def shopify_webhook():
     thread_ts = find_slack_thread(order_number)
 
     if thread_ts:
-        post_thread_reply(thread_ts, comment_text)
+        post_slack_thread_reply(thread_ts, comment_text)
         return jsonify({"status": "posted_in_thread"}), 200
 
     # ---- Fallback: post as new message ----
