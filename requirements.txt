@@ -1,3 +1,4 @@
-Flask
-requests
-gunicorn
+Flask==2.3.3
+slack-sdk==3.23.0
+python-dotenv==1.0.0
+gunicorn==21.2.0

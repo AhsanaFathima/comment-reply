@@ -1,178 +1,169 @@
-import os, re, requests, time, threading
-from flask import Flask, request
+import os
+import re
+import hmac
+import hashlib
+from datetime import datetime
+from flask import Flask, request, jsonify, abort
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
 
+# ---------------- INIT ----------------
+load_dotenv()
 app = Flask(__name__)
 
-# ---------------- ENV ----------------
-SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SHOP = os.getenv("SHOPIFY_SHOP")
-SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET")
 
-CHANNEL_ID = "C0A068PHZMY"
-ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-order_threads = {}
-last_comment_time = {}
-active_workers = set()
+# STRICT MATCH: ONLY "ST.order #1234"
+ORDER_REGEX = re.compile(r"\bST\.order\s+#(\d+)\b", re.IGNORECASE)
 
-print("🚀 App started", flush=True)
+# Prevent duplicate Slack replies
+processed_comments = set()
 
-# ---------------- HEALTH ----------------
-@app.route("/")
-@app.route("/health")
-def health():
-    return "OK", 200
+print("🚀 Shopify → Slack bridge started", flush=True)
 
-# ---------------- SLACK ----------------
-def wait_for_slack_thread(order_number, timeout=120):
-    print(f"⏳ Waiting for Slack ST.order #{order_number}", flush=True)
-    start = time.time()
+# ---------------- HELPERS ----------------
+def verify_shopify_webhook(raw_body, hmac_header):
+    """Verify Shopify webhook signature"""
+    if not SHOPIFY_WEBHOOK_SECRET:
+        print("⚠️ Webhook secret not set — skipping verification")
+        return True
 
-    while time.time() - start < timeout:
-        r = requests.get(
-            "https://slack.com/api/conversations.history",
-            headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-            params={"channel": CHANNEL_ID, "limit": 100},
-            timeout=10
-        )
-        if r.ok:
-            for msg in r.json().get("messages", []):
-                m = ORDER_REGEX.search(msg.get("text", ""))
-                if m and m.group(1) == order_number:
-                    print("✅ Slack thread found", flush=True)
-                    return msg["ts"]
-        time.sleep(5)
+    calculated_hmac = hmac.new(
+        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).digest()
 
-    return None
+    received_hmac = bytes.fromhex(hmac_header) if len(hmac_header) == 64 else None
+    return hmac.compare_digest(calculated_hmac, received_hmac)
 
-def slack_reply(thread_ts, text):
-    requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={
-            "Authorization": f"Bearer {SLACK_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "channel": CHANNEL_ID,
-            "thread_ts": thread_ts,
-            "text": text
-        },
-        timeout=10
-    )
 
-# ---------------- SHOPIFY ----------------
-def fetch_latest_comment(order_id):
-    query = """
-    query ($id: ID!) {
-      order(id: $id) {
-        events(first: 5, reverse: true) {
-          edges {
-            node {
-              __typename
-              ... on CommentEvent {
-                message
-                createdAt
-                author { name }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-
-    r = requests.post(
-        f"https://{SHOP}/admin/api/2024-01/graphql.json",
-        headers={
-            "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": query,
-            "variables": {"id": f"gid://shopify/Order/{order_id}"}
-        },
-        timeout=10
-    )
-
-    order = r.json().get("data", {}).get("order")
-    if not order:
-        return None
-
-    for edge in order["events"]["edges"]:
-        node = edge["node"]
-        if node["__typename"] == "CommentEvent":
-            return node
-
-    return None
-
-# ---------------- BACKGROUND WORKER ----------------
-def process_order(order_number, order_id):
-    print(f"🧵 Worker running for #{order_number}", flush=True)
+def find_slack_thread(order_number):
+    """Find Slack message containing exact ST.order #XXXX"""
+    search_text = f"st.order #{order_number}"
 
     try:
-        thread_ts = wait_for_slack_thread(order_number)
-        if not thread_ts:
-            return
+        response = slack_client.conversations_history(
+            channel=SLACK_CHANNEL_ID,
+            limit=200
+        )
 
-        order_threads[order_number] = thread_ts
+        for msg in response.get("messages", []):
+            if search_text in msg.get("text", "").lower():
+                return msg["ts"]
 
-        # 🔥 FIX: Send latest comment immediately (for old orders)
-        comment = fetch_latest_comment(order_id)
-        if comment:
-            last_comment_time[order_number] = comment["createdAt"]
-            slack_reply(
-                thread_ts,
-                f"💬 *{comment['author']['name']}*\n>{comment['message']}"
-            )
-            print("✅ Initial comment sent", flush=True)
+    except SlackApiError as e:
+        print("❌ Slack search error:", e.response["error"], flush=True)
 
-        idle_start = time.time()
+    return None
 
-        # Continue watching for NEW comments
-        while time.time() - idle_start < 300:
-            comment = fetch_latest_comment(order_id)
-            if comment:
-                ts = comment["createdAt"]
-                if last_comment_time.get(order_number) != ts:
-                    last_comment_time[order_number] = ts
-                    slack_reply(
-                        thread_ts,
-                        f"💬 *{comment['author']['name']}*\n>{comment['message']}"
-                    )
-                    print("✅ New comment sent", flush=True)
-                    idle_start = time.time()
-            time.sleep(10)
 
-    finally:
-        active_workers.discard(order_number)
-        print(f"⏹️ Worker stopped for #{order_number}", flush=True)
+def post_thread_reply(thread_ts, comment_text, author="Shopify"):
+    """Post reply in Slack thread"""
+    try:
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL_ID,
+            thread_ts=thread_ts,
+            text=f"💬 {comment_text}",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*💬 {author}*\n{comment_text}"
+                    }
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"_From Shopify • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+                        }
+                    ]
+                }
+            ]
+        )
+        print("✅ Slack thread reply posted", flush=True)
 
-# ---------------- WEBHOOK ----------------
-@app.route("/webhook/order-updated", methods=["POST"])
-def webhook():
-    data = request.json or {}
-    order_number = str(data.get("order_number") or data.get("name", "")).replace("#", "")
-    order_id = data.get("id")
+    except SlackApiError as e:
+        print("❌ Slack post error:", e.response["error"], flush=True)
 
-    print(f"\n🔔 Webhook for order #{order_number}", flush=True)
 
-    if not order_number or not order_id:
-        return "Invalid payload", 200
+# ---------------- ROUTES ----------------
+@app.route("/")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "Shopify Comment → Slack Thread"
+    })
 
-    if order_number in active_workers:
-        print("⏭️ Worker already running", flush=True)
-        return "Already running", 200
 
-    active_workers.add(order_number)
+@app.route("/webhook/shopify", methods=["POST"])
+def shopify_webhook():
+    # ---- Verify webhook ----
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+    if hmac_header and not verify_shopify_webhook(request.data, hmac_header):
+        abort(401, "Invalid webhook signature")
 
-    threading.Thread(
-        target=process_order,
-        args=(order_number, order_id),
-        daemon=True
-    ).start()
+    payload = request.get_json()
+    print("🔔 Shopify webhook received", flush=True)
 
-    return "OK", 200
+    comment_text = None
+    order_number = None
+
+    # ---- Extract comment from order ----
+    if "order" in payload:
+        order = payload["order"]
+        for note in order.get("note_attributes", []):
+            if note.get("name") == "note" and note.get("value"):
+                comment_text = note["value"]
+                break
+    else:
+        return jsonify({"status": "ignored"}), 200
+
+    # ---- Validate comment ----
+    if not comment_text:
+        return jsonify({"status": "no_comment"}), 200
+
+    match = ORDER_REGEX.search(comment_text)
+    if not match:
+        return jsonify({"status": "no_pattern"}), 200
+
+    order_number = match.group(1)
+
+    # ---- Deduplication ----
+    fingerprint = f"{order_number}:{comment_text.strip()}"
+    if fingerprint in processed_comments:
+        print("⏭️ Duplicate comment ignored", flush=True)
+        return jsonify({"status": "duplicate"}), 200
+
+    processed_comments.add(fingerprint)
+
+    print(f"📦 Matched ST.order #{order_number}", flush=True)
+
+    # ---- Find Slack thread ----
+    thread_ts = find_slack_thread(order_number)
+
+    if thread_ts:
+        post_thread_reply(thread_ts, comment_text)
+        return jsonify({"status": "posted_in_thread"}), 200
+
+    # ---- Fallback: post as new message ----
+    slack_client.chat_postMessage(
+        channel=SLACK_CHANNEL_ID,
+        text=f"💬 *Comment on ST.order #{order_number}*\n{comment_text}\n\n_(Thread not found)_"
+    )
+
+    return jsonify({"status": "posted_as_new"}), 200
+
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
